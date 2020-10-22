@@ -1,85 +1,64 @@
-use std::collections::HashMap;
-use std::convert::TryFrom;
-use std::marker::Unpin;
+use super::{Capability, ProtocolLine, NULLSHA};
+use std::collections::{HashMap, HashSet};
+use tokio::io::{self, AsyncWrite};
 
-/// Stuff to do with the fetch protocol
-use tokio::io::{self, AsyncRead, AsyncWrite};
-
-use super::Capability;
-use super::ProtocolLine;
-
-pub struct GitSend<R, W> {
-    reader: R,
-    writer: W,
-    caps: HashMap<Capability, Option<String>>,
-    refs: HashMap<String, String>,
-}
-
-impl<R, W> GitSend<R, W>
+pub async fn send_refchange<W>(
+    writer: &mut W,
+    existing: &HashMap<String, String>,
+    target: &HashMap<String, String>,
+    caps: impl Iterator<Item = (Capability, Option<&str>)>,
+) -> io::Result<bool>
 where
-    R: AsyncRead + Unpin,
     W: AsyncWrite + Unpin,
 {
-    pub fn new(reader: R, writer: W) -> Self {
-        Self {
-            reader,
-            writer,
-            caps: HashMap::new(),
-            refs: HashMap::new(),
-        }
-    }
-
-    pub async fn read_advertisement(&mut self) -> io::Result<()> {
-        loop {
-            match ProtocolLine::read_from(&mut self.reader, true).await? {
-                ProtocolLine::Flush => break,
-                ProtocolLine::Delimiter | ProtocolLine::ResponseEnd => {
-                    return Err(io::Error::new(
-                        io::ErrorKind::Other,
-                        "Unexpected protocol packet",
-                    ));
-                }
-                ProtocolLine::Data(cow) => {
-                    let mut bits = cow.split(|v| *v == 0);
-                    let refpart = bits.next().ok_or_else(|| {
-                        io::Error::new(
-                            io::ErrorKind::Other,
-                            "Unable to find ref-part of announcement line",
-                        )
-                    })?;
-                    if let Some(caps) = bits.next() {
-                        // We have some capabilities to process
-                        let caps = String::from_utf8_lossy(caps);
-                        for cap in caps.split(' ') {
-                            // if the capability has an equals in it, we need to split that off
-                            let (capname, capvalue) = if let Some(idx) = cap.find('=') {
-                                (&cap[..idx], Some(&cap[idx + 1..]))
-                            } else {
-                                (cap, None)
-                            };
-                            if let Ok(cap) = Capability::try_from(capname) {
-                                self.caps.insert(cap, capvalue.map(ToOwned::to_owned));
-                            }
-                        }
-                    }
-                    // Now process the ref part
-                    let refpart = String::from_utf8_lossy(refpart);
-                    if let Some(pos) = refpart.find(' ') {
-                        let (sha, refname) = {
-                            let p = refpart.split_at(pos);
-                            (p.0, &p.1[1..])
-                        };
-                        // On the off chance this repo has no refs yet, we'll still get a line to give us
-                        // capabilities, but it'll be magical
-                        if refname != "capabilities^{}" {
-                            self.refs.insert(refname.to_string(), sha.to_string());
-                        }
-                    } else {
-                        return Err(io::Error::new(io::ErrorKind::Other, "Malformed ref line"));
-                    }
-                }
+    let mut capstring = {
+        let mut ret = String::new();
+        for (cap, val) in caps {
+            if ret.is_empty() {
+                ret.push('\0');
+            } else {
+                ret.push(' ');
+            }
+            ret.push_str(cap.as_str());
+            if let Some(val) = val {
+                ret.push('=');
+                ret.push_str(val);
             }
         }
-        Ok(())
+        Some(ret)
+    };
+    // The refchange set we want to transmit comes down to tuples of oldsha newsha refname
+    // where oldsha is NULLSHA if we're creating something new, and newsha is NULLSHA if
+    // we're deleting something old.  Where the shas are the same there's no need to
+    // transmit the ref.
+    // In addition, existing may contain peeled refs, which we don't want to think about,
+    // so we filter those out
+    let all_refs: HashSet<_> = existing
+        .keys()
+        .chain(target.keys())
+        .filter(|k| k.starts_with("refs/") && !k.ends_with("^{}"))
+        .collect();
+
+    // For all the refs, write the change (if any) out
+    let mut need_pack = false;
+    for refname in all_refs {
+        let oldsha = existing.get(refname).map(String::as_str).unwrap_or(NULLSHA);
+        let newsha = target.get(refname).map(String::as_str).unwrap_or(NULLSHA);
+        if oldsha != newsha {
+            if newsha != NULLSHA {
+                need_pack = true;
+            }
+            // Worth sending the command
+            let cmd = if let Some(caps) = capstring.take() {
+                format!("{} {} {}{}\n", oldsha, newsha, refname, caps)
+            } else {
+                format!("{} {} {}\n", oldsha, newsha, refname)
+            };
+            ProtocolLine::write_str(writer, cmd).await?;
+        }
     }
+    // We terminate the refset change with a flush
+    ProtocolLine::Flush.write_to(writer).await?;
+
+    Ok(need_pack)
 }

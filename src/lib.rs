@@ -4,5 +4,5 @@ mod send;
 
 pub use protocol::*;
 
-pub use fetch::GitFetch;
-pub use send::GitSend;
+pub use fetch::*;
+pub use send::*;

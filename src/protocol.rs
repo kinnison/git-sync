@@ -1,9 +1,12 @@
 /// Git protocol related content
 use std::borrow::Cow;
+use std::collections::HashMap;
 use std::convert::TryFrom;
 
 use std::marker::Unpin;
 use tokio::io::{self, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+
+pub const NULLSHA: &str = "0000000000000000000000000000000000000000";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ProtocolLine<'a> {
@@ -212,5 +215,77 @@ impl<'a> TryFrom<&'a str> for Capability {
             "filter" => Capability::Filter,
             _ => return Err(value),
         })
+    }
+}
+
+pub struct RefAdvertisement {
+    caps: HashMap<Capability, Option<String>>,
+    refs: HashMap<String, String>,
+}
+
+impl RefAdvertisement {
+    pub async fn read_from<R>(reader: &mut R) -> io::Result<Self>
+    where
+        R: AsyncRead + Unpin,
+    {
+        let mut ret = Self {
+            caps: HashMap::new(),
+            refs: HashMap::new(),
+        };
+        loop {
+            match ProtocolLine::read_from(reader, true).await? {
+                ProtocolLine::Flush => break,
+                ProtocolLine::Delimiter | ProtocolLine::ResponseEnd => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::Other,
+                        "Unexpected protocol packet",
+                    ));
+                }
+                ProtocolLine::Data(cow) => {
+                    let mut bits = cow.split(|v| *v == 0);
+                    let refpart = bits.next().ok_or_else(|| {
+                        io::Error::new(
+                            io::ErrorKind::Other,
+                            "Unable to find ref-part of announcement line",
+                        )
+                    })?;
+                    if let Some(caps) = bits.next() {
+                        // We have some capabilities to process
+                        let caps = String::from_utf8_lossy(caps);
+                        for cap in caps.split(' ') {
+                            // if the capability has an equals in it, we need to split that off
+                            let (capname, capvalue) = if let Some(idx) = cap.find('=') {
+                                (&cap[..idx], Some(&cap[idx + 1..]))
+                            } else {
+                                (cap, None)
+                            };
+                            if let Ok(cap) = Capability::try_from(capname) {
+                                ret.caps.insert(cap, capvalue.map(ToOwned::to_owned));
+                            }
+                        }
+                    }
+                    // Now process the ref part
+                    let refpart = String::from_utf8_lossy(refpart);
+                    if let Some(pos) = refpart.find(' ') {
+                        let (sha, refname) = {
+                            let p = refpart.split_at(pos);
+                            (p.0, &p.1[1..])
+                        };
+                        ret.refs.insert(refname.to_string(), sha.to_string());
+                    } else {
+                        return Err(io::Error::new(io::ErrorKind::Other, "Malformed ref line"));
+                    }
+                }
+            }
+        }
+        Ok(ret)
+    }
+
+    pub fn caps(&self) -> &HashMap<Capability, Option<String>> {
+        &self.caps
+    }
+
+    pub fn refs(&self) -> &HashMap<String, String> {
+        &self.refs
     }
 }
