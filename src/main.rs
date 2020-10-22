@@ -76,8 +76,27 @@ async fn main() -> io::Result<()> {
 
     println!("Reading ref set available in source...");
     let source_advert = RefAdvertisement::read_from(upload_pack.reader()).await?;
+
+    for cap in source_advert.caps() {
+        println!(
+            "  Capability: {}{}{}",
+            cap.0.as_str(),
+            if cap.1.is_some() { "=" } else { "" },
+            cap.1.as_deref().unwrap_or("")
+        );
+    }
+
     println!("Reading ref set available in target...");
     let target_advert = RefAdvertisement::read_from(receive_pack.reader()).await?;
+
+    for cap in target_advert.caps() {
+        println!(
+            "  Capability: {}{}{}",
+            cap.0.as_str(),
+            if cap.1.is_some() { "=" } else { "" },
+            cap.1.as_deref().unwrap_or("")
+        );
+    }
 
     // Compute the set of things we want to fetch
     let wants: HashSet<_> = source_advert
@@ -115,6 +134,7 @@ async fn main() -> io::Result<()> {
 
     let upload_caps = &[
         (Capability::ReportStatus, None),
+        (Capability::Atomic, None),
         (Capability::SideBand64K, None),
         (Capability::Agent, Some("git_sync/0.1")),
     ];
@@ -132,13 +152,18 @@ async fn main() -> io::Result<()> {
     // Now process the pack data...
 
     println!(
-        "We do{} expect pack data",
+        "We do{} expect to transfer pack data",
         if expecting_pack_data { "" } else { " not" }
     );
-    println!(
-        "We do{} want to send pack data",
-        if expecting_to_send { "" } else { " not" }
-    );
+    match expecting_to_send {
+        SendActivity::Nothing => println!("We're doing nothing with receive-pack"),
+        SendActivity::Deleting => {
+            println!("We're not needing to send a pack, but we need to read a report")
+        }
+        SendActivity::Sending => {
+            println!("We're definitely needing to send a pack to receive-pack")
+        }
+    };
 
     if expecting_pack_data {
         println!("Transferring pack data");
@@ -161,50 +186,55 @@ async fn main() -> io::Result<()> {
                 }
             }
         }
+    } else if matches!(expecting_to_send, SendActivity::Sending) {
+        println!("We're expected to send a pack, but we have no objects to send");
+        println!("Let's send the magical empty pack to the receive-pack service...");
+        receive_pack.writer().write_all(EMPTY_PACK).await?;
     }
 
     println!("Shutting down upload-pack service");
     // Done with upload pack:
     upload_pack.die().await?;
 
-    println!("Waiting for result from receive-pack service");
-    // We've now sent the pack to the other end, let's read and report the receive pack output
-    let mut rp_out = Vec::new();
-    loop {
-        match ProtocolLine::read_from(receive_pack.reader(), false).await? {
-            ProtocolLine::Data(cow) => match cow[0] {
-                1 => {
-                    let data = &cow[1..];
-                    rp_out.extend_from_slice(data);
+    if !matches!(expecting_to_send, SendActivity::Nothing) {
+        println!("Waiting for result from receive-pack service");
+        // We've now sent the pack to the other end, let's read and report the receive pack output
+        let mut rp_out = Vec::new();
+        loop {
+            match ProtocolLine::read_from(receive_pack.reader(), false).await? {
+                ProtocolLine::Data(cow) => match cow[0] {
+                    1 => {
+                        let data = &cow[1..];
+                        rp_out.extend_from_slice(data);
+                    }
+                    2 => print!("{}", String::from_utf8_lossy(&cow[1..])),
+                    3 => eprint!("{}", String::from_utf8_lossy(&cow[1..])),
+                    v => eprintln!("Received {} bytes on channel {}", cow.len() - 1, v),
+                },
+                ProtocolLine::Flush => break,
+                l => {
+                    println!("RPE: Encountered a {:?}", l);
+                    break;
                 }
-                2 => print!("{}", String::from_utf8_lossy(&cow[1..])),
-                3 => eprint!("{}", String::from_utf8_lossy(&cow[1..])),
-                v => eprintln!("Received {} bytes on channel {}", cow.len() - 1, v),
-            },
-            ProtocolLine::Flush => break,
-            l => {
-                println!("RPE: Encountered a {:?}", l);
-                break;
+            }
+        }
+
+        println!("Report from receive-pack is {} bytes:", rp_out.len());
+        let mut cursor = Cursor::new(rp_out);
+        loop {
+            match ProtocolLine::read_from(&mut cursor, true).await? {
+                ProtocolLine::Data(cow) => {
+                    let s = String::from_utf8_lossy(&cow);
+                    println!("remote: {}", s);
+                }
+                ProtocolLine::Flush => break,
+                l => {
+                    println!("RPE: Encountered encapsulated {:?}", l);
+                    break;
+                }
             }
         }
     }
-    let mut cursor = Cursor::new(rp_out);
-
-    println!("Report from receive-pack is:");
-    loop {
-        match ProtocolLine::read_from(&mut cursor, true).await? {
-            ProtocolLine::Data(cow) => {
-                let s = String::from_utf8_lossy(&cow);
-                println!("remote: {}", s);
-            }
-            ProtocolLine::Flush => break,
-            l => {
-                println!("RPE: Encountered encapsulated {:?}", l);
-                break;
-            }
-        }
-    }
-
     // We're done, let's close down our connections
     println!("Shutting down receive-pack service");
     receive_pack.die().await?;
