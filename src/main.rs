@@ -15,6 +15,12 @@ use structopt::StructOpt;
 
 #[derive(StructOpt)]
 struct Cli {
+    /// If set, the source is an SSH server
+    #[structopt(long = "source-server", short = "s")]
+    source_server: Option<String>,
+    /// If set, the destination is an SSH server
+    #[structopt(long = "dest-server", short = "d")]
+    dest_server: Option<String>,
     /// The source repository
     source: PathBuf,
     /// The target repository
@@ -50,6 +56,30 @@ impl Service {
         })
     }
 
+    pub async fn launch_ssh<P>(server: &str, service: &str, path: P) -> Result<Service, io::Error>
+    where
+        P: AsRef<Path>,
+    {
+        let mut child = Command::new("ssh")
+            .arg(server)
+            .arg(service)
+            .arg(path.as_ref())
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::inherit())
+            .spawn()?;
+        let reader = child.stdout.take().expect("Did not get a stdout handle?");
+        let writer = child.stdin.take().expect("Did not get a stdin handle?");
+
+        let handle = tokio::spawn(async move { child.wait().await });
+
+        Ok(Service {
+            handle,
+            reader,
+            writer,
+        })
+    }
+
     pub async fn die(self) -> Result<ExitStatus, io::Error> {
         self.handle.await?
     }
@@ -71,8 +101,16 @@ async fn main() -> io::Result<()> {
     let opts: Cli = Cli::from_args();
 
     println!("Connecting to services...");
-    let mut upload_pack = Service::launch("git-upload-pack", &opts.source).await?;
-    let mut receive_pack = Service::launch("git-receive-pack", &opts.target).await?;
+    let mut upload_pack = if let Some(server) = opts.source_server.as_deref() {
+        Service::launch_ssh(server, "git-upload-pack", &opts.source).await?
+    } else {
+        Service::launch("git-upload-pack", &opts.source).await?
+    };
+    let mut receive_pack = if let Some(server) = opts.dest_server.as_deref() {
+        Service::launch_ssh(server, "git-receive-pack", &opts.target).await?
+    } else {
+        Service::launch("git-receive-pack", &opts.target).await?
+    };
 
     println!("Reading ref set available in source...");
     let source_advert = RefAdvertisement::read_from(upload_pack.reader()).await?;
